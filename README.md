@@ -1,43 +1,45 @@
 
 # Vivify Quest Port
 ------
-## Installation For Making Your Own
-(You can make your own. give credits down below)
+## Instructions for building the project yourself
+(You can build your own .qmod, just make sure to give credit if distributing)
 
-This is How To Build it
+## Requirements for build
+* [Quest Package Manager](https://github.com/sc2ad/QuestPackageManager) (QPM)
 
+### To build:
 ```
 qpm restore
 qpm s build
 qpm s qmod
 ```
 
-If it says "qpm is not recognized" then you don't have qpm. if it says pwsh is not avaiable. then change the script commands in qpm.json and in scripts to powershell. OR get latest powershell.
+If you have QPM installed but throws an error, use `.\qpm` instead
 
-If you do have QPM installed but still gives an error. do .\qpm (with a .\ in it)
+## Installation
 
-## How to install it onto your quest.
+*For the best experience, mod your game using [ModsBeforeFriday](https://mbf.bsquest.xyz/) on version 1.40.8*
 
-Most People don't know how to install it when they are new. this is a tutorial.
+*A [tutorial](https://bsmg.wiki/quest/modding-with-mbf.html) by the Beat Saber Modding Group (BSMG)'s wiki for those who are new to this*
+### Through ModsBeforeFriday (MBF)
+1. Download the latest `vivify.qmod` file from the **Releases** tab, or build it yourself as shown above.
+2. Once your headset is modded, connect it to your computer and drag and drop `vivify.qmod` into MBF.
+3. Alternatively, click the **ADD FILES** button and select the `.qmod` file.
+4. Safely disconnect your headset, then launch Beat Saber.
 
-Go onto [ModsBeforeFriday](https://mbf.bsquest.xyz/) And connect your quest to your PC (Via ADB).
-Now you have to own beatsaber and have it installed. if you do not own beatsaber you need to buy it on quest. if you do not have it installed. please install it before continuing.
-Now if you have beatsaber installed and own beatsaber. you are gonna let MBF connect to your quest. it might give a warning. but you are gonna select 1.40.8 as the modded version. (BEST MODDED VERSION RIGHT NOW) and accept. now its gonna take 10 - 20 minutes for MBF to finish. (might take longer depending on your wifi) Now when MBF says app is modded. you can install any mod you want. (Get Chroma, NE, and ME, For best gameplay on maps.) and after you do so. just go to where vivify.qmod is. then drag and drop it into MBF. or click "ADD FILES" then select the .qmod
-
-## Dependencies
-(For the .qmod)
-
-* beatsaber-hook
-* custom-types
+## .qmod Dependencies
+**MOST OF THESE ARE CORE MODS INSTALLED WHEN YOU MOD USING MBF. INSTALL ANY MISSING MODS.**
+* [beatsaber-hook](https://github.com/QuestPackageManager/beatsaber-hook)
+* [custom-types](https://github.com/QuestPackageManager/Il2CppQuestTypePatching/)
 * custom-json-data
 * tracks
-* bsml
-* songcore
-* paper2_scotland2
+* [bsml](https://github.com/bsq-ports/Quest-BSML/)
+* [songcore](https://github.com/raineaeternal/Quest-SongCore/)
+* [paper2_scotland2](https://github.com/Fernthedev/paperlog/)
 * web-utils
-* metacore
+* [metacore](https://github.com/Fernthedev/paperlog/)
 
-(For The Project.) (in qpm.json)
+## Project dependencies (in qpm.json)
 
 * beatsaber-hook ^6.4.2
 * bs-cordl 4008.*
@@ -55,13 +57,15 @@ Now if you have beatsaber installed and own beatsaber. you are gonna let MBF con
 * cpp-semver ^0.1.2
 * metacore ^1.0.3
 
-MOST OF THESE ARE BASE CORE MODS INSTALLED WHEN YOU USE MBF. MOST ARE NEEDED TO BE INSTALLED MANUALLY.
-
 ## Credits
-DO NOT STEAL CODE AT ALL FROM OTHERS, STEALING CODE IS A CRIME. PLEASE DO NOT STEAL ANYONES WORK OR EVEN ATTEMPT TOO.
-I borrowed some of this code from
-[Axo-lotl](https://github.com/axo-lotl/Vivify-Quest)
-**LookingForScripts1**
-I borrowed LookingForScripts code. so thank you to him. also thank you to axo-lotl for giving 0.4.0 early to meh :)
+axo-lotl. (2026). GitHub - *axo-lotl/Vivify-Quest: vivify quest port (new repo for some reason).* GitHub. https://github.com/axo-lotl/vivify-quest
 
-(Edit: No link for LookingForScripts1. he removed his fork of axo-lotls so that means i physically don't have it)
+*This project contains code that was adapted from an open-source repository by [LookingForScripts1](https://github.com/Lookingforscripts1) that has since been deleted. Because the repository is no longer available, I am unfortunately unable to identify or link to the original repository.*
+
+### Special thanks
+Thank you to axo-lotl for giving version 0.4.0 early to meh :)
+
+## License details
+All rights reserved.
+
+No part of this repository may be copied, modified, distributed, or incorporated into other software without the express written permission of the repository owner.
