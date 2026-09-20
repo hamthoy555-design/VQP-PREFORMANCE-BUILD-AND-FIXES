@@ -380,10 +380,30 @@ void HandleCreateCamera(rapidjson::Value const& json) {
   }
   cam.camera = go->AddComponent<UnityEngine::Camera*>();
   if (mainCam != nullptr) cam.camera->CopyFrom(mainCam);
+  // Secondary cameras (map mirrors etc.) render flat images into their RT.
+  // CopyFrom clones the main camera's stereo target eye (Both) — rendering
+  // stereo into a plain RT produces split/garbled output on Quest.
+  cam.camera->set_stereoTargetEye(UnityEngine::StereoTargetEyeMask::None);
+  // Never inherit a mirror/secondary camera's "Nothing" clear state. An RT's
+  // first contents are undefined on Quest, which appears as colored pixel noise
+  // and can persist when the camera renders fewer fragments than the previous
+  // frame. A solid black clear is the safe baseline; Vivify effects still draw
+  // on top of it and depth is cleared by the 24-bit color RT attachment.
+  cam.camera->set_clearFlags(UnityEngine::CameraClearFlags::Color);
+  cam.camera->set_backgroundColor(UnityEngine::Color(0.0f, 0.0f, 0.0f, 0.0f));
   cam.camera->set_depth(mainCam ? mainCam->get_depth() - 1 : -2);
   EnsureMultipassKeywordController(go);
   int w = 1024, h = 512;
   if (mainCam != nullptr) { w = mainCam->get_pixelWidth(); h = mainCam->get_pixelHeight(); }
+  // Secondary cameras are the most expensive Vivify feature: they re-render
+  // the scene. Keep the HMD/main camera untouched, but render mirror targets
+  // at a cheaper size in Performance Mode. The texture is still composited at
+  // its normal destination size, so this never lowers headset resolution.
+  if (GetPerformanceModeEnabled()) {
+    constexpr float kMirrorResolutionScale = 0.70f;
+    w = std::max(1, static_cast<int>(w * kMirrorResolutionScale));
+    h = std::max(1, static_cast<int>(h * kMirrorResolutionScale));
+  }
   if (_secondaryCameras.size() >= kAbsMaxSecondaryCameras) {
     if (WarnThrottled(_warnFrameCameras, _frameCounter)) {
       PaperLogger.warn(
@@ -398,7 +418,7 @@ void HandleCreateCamera(rapidjson::Value const& json) {
     if (!TryReserveRTPixels(w, h, colorFormat, "camera-color:" + name)) {
       return;
     }
-    cam.colorRT = UnityEngine::RenderTexture::New_ctor(w, h, 0, colorFormat);
+    cam.colorRT = UnityEngine::RenderTexture::New_ctor(w, h, 24, colorFormat);
     bool colorCreated = IsAlive(cam.colorRT) && cam.colorRT->Create();
     if (GetVivifyDebugLogging()) {
       PaperLogger.info("Vivify CreateCamera color RT: id='{}' texture='{}' size={}x{} format={} created={}",
