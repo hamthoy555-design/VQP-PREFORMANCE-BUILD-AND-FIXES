@@ -1,5 +1,6 @@
 #include "main.hpp"
 #include "VivifyRuntime.hpp"
+#include <algorithm>
 #include <string_view>
 #include "HMUI/ViewController.hpp"
 #include "UnityEngine/GameObject.hpp"
@@ -21,6 +22,11 @@ constexpr std::string_view kDisableCreateCameraDepthConfigKey = "disableCreateCa
 constexpr std::string_view kDisableVRCenterAdjustConfigKey = "disableVRCenterAdjust";
 constexpr std::string_view kDisableCustomNoteVisualsConfigKey = "disableCustomNoteVisuals";
 constexpr std::string_view kDisableVisualsInMultiplayerConfigKey = "disableVisualsInMultiplayer";
+constexpr std::string_view kSafeModeLimitsConfigKey = "safeModeLimits";
+constexpr std::string_view kMaxActivePrefabsConfigKey = "maxActivePrefabs";
+constexpr std::string_view kMaxNoteVisualFragmentsConfigKey = "maxNoteVisualFragments";
+constexpr std::string_view kMaxTotalPixelsConfigKey = "maxTotalRenderTexturePixels";
+constexpr std::string_view kAllowWindowsBundleFallbackConfigKey = "allowWindowsBundleFallback";
 bool gMultipassRenderingEnabled = true;
 bool gVivifyDebugLogging = false;
 bool gDisableBeat0FilmgrainBlit = false;
@@ -29,6 +35,14 @@ bool gDisableCreateCameraDepth = false;
 bool gDisableVRCenterAdjust = false;
 bool gDisableCustomNoteVisuals = false;
 bool gDisableVisualsInMultiplayer = true;
+// Resource safety limits: heavy Vivify maps (mirrors + several cameras + dozens
+// of prefabs) can push the Quest into a GPU driver reset / OOM kill. These caps
+// make the mod fail soft — it degrades visuals instead of crashing the game.
+bool gSafeModeLimits = true;
+bool gAllowWindowsBundleFallback = false;
+int gMaxActivePrefabs = 96;
+int gMaxNoteVisualFragments = 12;
+int gMaxTotalPixels = 8 * 1024 * 1024; // ~8M pixels ≈ 32MB ARGB32 across all RTs
 
 void EnsureConfigObject() {
   auto& doc = getConfig().config;
@@ -94,26 +108,9 @@ void SetDisableCreateCameraDepth(bool enabled) {
   Vivify::RefreshIsolationSettings();
 }
 
-bool GetDisableCustomNoteVisuals() {
-  // Force-enable custom note visuals on Quest forks.
-  return false;
-}
-
-void SetDisableCustomNoteVisuals(bool enabled) {
-  SetBoolConfigValue(kDisableCustomNoteVisualsConfigKey, enabled, gDisableCustomNoteVisuals);
-}
-
 void SetDisableVRCenterAdjust(bool enabled) {
   SetBoolConfigValue(kDisableVRCenterAdjustConfigKey, enabled, gDisableVRCenterAdjust);
   Vivify::RefreshIsolationSettings();
-}
-
-bool GetDisableVisualsInMultiplayer() {
-  return gDisableVisualsInMultiplayer;
-}
-
-void SetDisableVisualsInMultiplayer(bool enabled) {
-  SetBoolConfigValue(kDisableVisualsInMultiplayerConfigKey, enabled, gDisableVisualsInMultiplayer);
 }
 
 void RegisterModSettings() {
@@ -137,9 +134,15 @@ void RegisterModSettings() {
         BSML::Lite::CreateToggle(container->get_transform(), u"Disable Custom Vivify Note Visuals",
                                  GetDisableCustomNoteVisuals(),
                                  [](bool value) { SetDisableCustomNoteVisuals(value); });
+        BSML::Lite::CreateToggle(container->get_transform(), u"Safe Mode Limits (prevent crashes on heavy maps)",
+                                 GetSafeModeLimits(),
+                                 [](bool value) { SetSafeModeLimits(value); });
+        BSML::Lite::CreateToggle(container->get_transform(), u"Allow Windows bundles (risky fallback)",
+                                 GetAllowWindowsBundleFallback(),
+                                 [](bool value) { SetAllowWindowsBundleFallback(value); });
         BSML::Lite::CreateToggle(container->get_transform(), u"Disable Vivify Visuals In Multiplayer",
-               GetDisableVisualsInMultiplayer(),
-               [](bool value) { SetDisableVisualsInMultiplayer(value); });
+                                 GetDisableVisualsInMultiplayer(),
+                                 [](bool value) { SetDisableVisualsInMultiplayer(value); });
         BSML::Lite::CreateToggle(container->get_transform(), u"Disable CreateCamera/Depth",
                                  GetDisableCreateCameraDepth(),
                                  [](bool value) { SetDisableCreateCameraDepth(value); });
@@ -149,7 +152,7 @@ void RegisterModSettings() {
       },
       "Vivify", false);
 }
-}
+}  // namespace
 
 Configuration &getConfig() {
   static Configuration config(modInfo);
@@ -180,8 +183,79 @@ bool GetDisableVRCenterAdjust() {
   return gDisableVRCenterAdjust;
 }
 
+bool GetDisableVisualsInMultiplayer() {
+  return gDisableVisualsInMultiplayer;
+}
+
+void SetDisableVisualsInMultiplayer(bool enabled) {
+  SetBoolConfigValue(kDisableVisualsInMultiplayerConfigKey, enabled, gDisableVisualsInMultiplayer);
+}
+
+bool GetDisableCustomNoteVisuals() {
+  return gDisableCustomNoteVisuals;
+}
+
+bool GetSafeModeLimits() {
+  return gSafeModeLimits;
+}
+
+bool GetAllowWindowsBundleFallback() {
+  return gAllowWindowsBundleFallback;
+}
+
+int GetMaxActivePrefabs() {
+  return gMaxActivePrefabs;
+}
+
+int GetMaxNoteVisualFragments() {
+  return gMaxNoteVisualFragments;
+}
+
+int GetMaxTotalPixels() {
+  return gMaxTotalPixels;
+}
+
 void SetMultipassRenderingEnabled(bool enabled) {
   SetBoolConfigValue(kMultipassRenderingConfigKey, enabled, gMultipassRenderingEnabled);
+}
+
+void SetSafeModeLimits(bool enabled) {
+  SetBoolConfigValue(kSafeModeLimitsConfigKey, enabled, gSafeModeLimits);
+}
+
+void SetAllowWindowsBundleFallback(bool enabled) {
+  SetBoolConfigValue(kAllowWindowsBundleFallbackConfigKey, enabled, gAllowWindowsBundleFallback);
+}
+
+void SetDisableCustomNoteVisuals(bool enabled) {
+  SetBoolConfigValue(kDisableCustomNoteVisualsConfigKey, enabled, gDisableCustomNoteVisuals);
+}
+
+void SetMaxActivePrefabs(int limit) {
+  gMaxActivePrefabs = std::clamp(limit, 8, 512);
+  auto& config = getConfig();
+  auto& doc = config.config;
+  auto it = doc.FindMember(kMaxActivePrefabsConfigKey.data());
+  if (it != doc.MemberEnd()) it->value.SetInt(gMaxActivePrefabs);
+  config.Write();
+}
+
+void SetMaxNoteVisualFragments(int limit) {
+  gMaxNoteVisualFragments = std::clamp(limit, 1, 64);
+  auto& config = getConfig();
+  auto& doc = config.config;
+  auto it = doc.FindMember(kMaxNoteVisualFragmentsConfigKey.data());
+  if (it != doc.MemberEnd()) it->value.SetInt(gMaxNoteVisualFragments);
+  config.Write();
+}
+
+void SetMaxTotalPixels(int limit) {
+  gMaxTotalPixels = std::clamp(limit, 512 * 1024, 64 * 1024 * 1024);
+  auto& config = getConfig();
+  auto& doc = config.config;
+  auto it = doc.FindMember(kMaxTotalPixelsConfigKey.data());
+  if (it != doc.MemberEnd()) it->value.SetInt(gMaxTotalPixels);
+  config.Write();
 }
 
 void EnsureConfigDefaults() {
@@ -197,18 +271,34 @@ void EnsureConfigDefaults() {
   needsWrite |= EnsureBoolConfigValue(kDisableVisualsInMultiplayerConfigKey, true, gDisableVisualsInMultiplayer);
   needsWrite |= EnsureBoolConfigValue(kDisableCreateCameraDepthConfigKey, false, gDisableCreateCameraDepth);
   needsWrite |= EnsureBoolConfigValue(kDisableVRCenterAdjustConfigKey, false, gDisableVRCenterAdjust);
+  needsWrite |= EnsureBoolConfigValue(kSafeModeLimitsConfigKey, true, gSafeModeLimits);
+  needsWrite |= EnsureBoolConfigValue(kAllowWindowsBundleFallbackConfigKey, false, gAllowWindowsBundleFallback);
+  // Int limits: clamp into range, write back if the stored value was missing/out of range.
+  auto ensureIntConfigValue = [&](std::string_view key, int defaultValue, int& value, int min, int max) {
+    auto it = doc.FindMember(key.data());
+    if (it != doc.MemberEnd() && it->value.IsInt()) {
+      value = std::clamp(it->value.GetInt(), min, max);
+      if (value != it->value.GetInt()) {
+        it->value.SetInt(value);
+        needsWrite = true;
+      }
+      return;
+    }
+    value = defaultValue;
+    auto& allocator = doc.GetAllocator();
+    if (it == doc.MemberEnd()) {
+      doc.AddMember(rapidjson::Value(key.data(), allocator), rapidjson::Value(defaultValue), allocator);
+    } else {
+      it->value.SetInt(defaultValue);
+    }
+    needsWrite = true;
+  };
+  ensureIntConfigValue(kMaxActivePrefabsConfigKey, gMaxActivePrefabs, gMaxActivePrefabs, 8, 512);
+  ensureIntConfigValue(kMaxNoteVisualFragmentsConfigKey, gMaxNoteVisualFragments, gMaxNoteVisualFragments, 1, 64);
+  ensureIntConfigValue(kMaxTotalPixelsConfigKey, gMaxTotalPixels, gMaxTotalPixels, 512 * 1024, 64 * 1024 * 1024);
   if (needsWrite) {
     config.Write();
   }
-}
-
-bool GetDisableCustomNoteVisuals() {
-  // Force-enable custom note visuals on Quest forks.
-  return false;
-}
-
-bool GetDisableVisualsInMultiplayer() {
-  return gDisableVisualsInMultiplayer;
 }
 
 MOD_EXTERN_FUNC void setup(CModInfo *info) noexcept {

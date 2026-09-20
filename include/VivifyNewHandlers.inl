@@ -231,6 +231,14 @@ void HandleCreateScreenTexture(rapidjson::Value const& json) {
   auto id = ReadStringView(json, "id");
   if (!id.has_value()) return;
   std::string name(*id);
+  if (_declaredTextures.size() >= kAbsMaxDeclaredTextures && !_declaredTextures.contains(name)) {
+    if (WarnThrottled(_warnFrameTextures, _frameCounter)) {
+      PaperLogger.warn(
+          "Vivify resource limit: refusing CreateScreenTexture '{}' — {} textures already active (map is asking for too many screen textures)",
+          name, kAbsMaxDeclaredTextures);
+    }
+    return;
+  }
   if (auto existing = _declaredTextures.find(name); existing != _declaredTextures.end()) {
     ReleaseDeclaredTextureData(existing->second);
     _declaredTextures.erase(existing);
@@ -299,6 +307,9 @@ void HandleCreateScreenTexture(rapidjson::Value const& json) {
         dt.propertyId,
         BoolText(UnityEngine::XR::XRSettings::get_useOcclusionMesh()));
   }
+  if (!TryReserveRTPixels(w, h, fmt, "screen-texture")) {
+    return;
+  }
   dt.texture = UnityEngine::RenderTexture::New_ctor(w, h, 0, fmt);
   if (dt.filterMode.has_value()) dt.texture->set_filterMode(dt.filterMode.value());
   if (!IsAlive(dt.texture) || !dt.texture->Create()) {
@@ -355,6 +366,13 @@ void HandleCreateCamera(rapidjson::Value const& json) {
   if (GetDisableCreateCameraDepth()) {
     cam.properties.depthTextureMode.reset();
   }
+  if (cam.properties.depthTextureMode.has_value() &&
+      cam.properties.depthTextureMode.value().value__ == UnityEngine::DepthTextureMode::None.value__) {
+    // Explicit None from the map: stop before creating any render targets.
+    ReleaseSecondaryCameraData(cam);
+    _secondaryCameras[name] = std::move(cam);
+    return;
+  }
   auto mainCam = UnityEngine::Camera::get_main();
   auto* go = UnityEngine::GameObject::New_ctor(StringW("VivifyCamera_" + name));
   if (mainCam != nullptr) {
@@ -366,8 +384,20 @@ void HandleCreateCamera(rapidjson::Value const& json) {
   EnsureMultipassKeywordController(go);
   int w = 1024, h = 512;
   if (mainCam != nullptr) { w = mainCam->get_pixelWidth(); h = mainCam->get_pixelHeight(); }
+  if (_secondaryCameras.size() >= kAbsMaxSecondaryCameras) {
+    if (WarnThrottled(_warnFrameCameras, _frameCounter)) {
+      PaperLogger.warn(
+          "Vivify resource limit: refusing CreateCamera '{}' — {} secondary cameras already active (each is a full scene re-render; mirror stacks are the usual cause)",
+          name, kAbsMaxSecondaryCameras);
+    }
+    UnityEngine::Object::Destroy(go);
+    return;
+  }
   if (cam.texturePropertyId.has_value()) {
     auto colorFormat = SupportedRenderTextureFormat(UnityEngine::RenderTextureFormat::ARGB32, "CreateCamera:color:" + name);
+    if (!TryReserveRTPixels(w, h, colorFormat, "camera-color:" + name)) {
+      return;
+    }
     cam.colorRT = UnityEngine::RenderTexture::New_ctor(w, h, 0, colorFormat);
     bool colorCreated = IsAlive(cam.colorRT) && cam.colorRT->Create();
     if (GetVivifyDebugLogging()) {
@@ -378,12 +408,17 @@ void HandleCreateCamera(rapidjson::Value const& json) {
       ReleaseSecondaryCameraData(cam);
       return;
     }
+    cam.colorRTOwned = true;
     cam.camera->set_targetTexture(cam.colorRT);
     UnityEngine::Shader::SetGlobalTexture(cam.texturePropertyId.value(),
       static_cast<UnityEngine::Texture*>(cam.colorRT));
   }
   if (cam.depthTexturePropertyId.has_value()) {
     if (UnityEngine::SystemInfo::SupportsRenderTextureFormat(UnityEngine::RenderTextureFormat::Depth)) {
+      if (!TryReserveRTPixels(w, h, UnityEngine::RenderTextureFormat::Depth, "camera-depth:" + name)) {
+        ReleaseSecondaryCameraData(cam);
+        return;
+      }
       cam.depthRT = UnityEngine::RenderTexture::New_ctor(w, h, 24, UnityEngine::RenderTextureFormat::Depth);
       bool depthCreated = IsAlive(cam.depthRT) && cam.depthRT->Create();
       if (GetVivifyDebugLogging()) {
@@ -394,6 +429,7 @@ void HandleCreateCamera(rapidjson::Value const& json) {
       if (depthCreated) {
         UnityEngine::Shader::SetGlobalTexture(cam.depthTexturePropertyId.value(),
           static_cast<UnityEngine::Texture*>(cam.depthRT));
+        cam.depthRTOwned = true;
       } else {
         ReleaseRenderTexture(cam.depthRT);
       }
@@ -518,9 +554,12 @@ void HandleSetCameraProperty(rapidjson::Value const& json) {
                      BoolText(UnityEngine::XR::XRSettings::get_useOcclusionMesh()));
   }
   _cameraProperties[camId] = props;
+  ++_cameraPropsGeneration;
   if (camId == "_Main") {
     auto mainCam = UnityEngine::Camera::get_main();
     ApplyCameraProperties(mainCam, props);
+    _cameraPropsAppliedGeneration = _cameraPropsGeneration;
+    _cameraPropsAppliedGO = IsAlive(mainCam) ? mainCam->get_gameObject().unsafePtr() : nullptr;
   } else {
     auto it = _secondaryCameras.find(camId);
     if (it != _secondaryCameras.end()) {

@@ -208,6 +208,45 @@ void SetGlobalKeyword(::StringW keyword, bool enabled) {
     UnityEngine::Shader::DisableKeyword(keyword);
   }
 }
+// Returns true when the camera will actually be composited into the player's
+// stereo view. Beat Saber's mirror cameras render each frame with
+// stereoTargetEye == Both and stereoActiveEye cycles Left → Right — the same
+// values the main camera reports. Distinguishing them by eye state or target
+// texture is unreliable: a single inactive mirror would flip the global stereo
+// keywords off for the Left-eye pass and every subsequent mirror shows the
+// right-eye image offset/glitched.
+//
+// The main gameplay camera is identified structurally: Beat Saber's MainCamera
+// prefab root is named "MainCamera" (mirror rigs parented under it get
+// "MainCamera (Mirror)" clone names). Vivify's own overlay camera is also an
+// owner. Everything else (mirrors, secondary map cameras) must never touch the
+// global stereo keyword state.
+// Helpers defined later in this file's anonymous namespace; declared here so
+// the camera-state helpers above can use them.
+bool IsManagedAlive(UnityEngine::Object* object);
+template <class T>
+T* SafeUnityPtr(UnityW<T> object);
+std::string ToStdString(::StringW value);
+bool IsShaderStateOwnerCamera(UnityEngine::Camera* camera) {
+  if (!IsManagedAlive(camera)) return false;
+  auto* go = SafeUnityPtr(camera->get_gameObject());
+  if (!IsManagedAlive(go)) return false;
+  for (UnityEngine::Transform* t = SafeUnityPtr(go->get_transform()); IsManagedAlive(t); t = SafeUnityPtr(t->get_parent())) {
+    auto name = t->get_gameObject().unsafePtr() != nullptr ? t->get_gameObject()->get_name() : ::StringW(nullptr);
+    if (name) {
+      std::string n = ToStdString(name);
+      std::string lower;
+      lower.reserve(n.size());
+      for (char c : n) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+      // "MainCamera (Mirror)" etc. are clones — never owners.
+      if (lower.find("mirror") != std::string::npos) return false;
+      // Vivify's overlay camera composites custom visuals into the stereo view.
+      if (lower == "vivifygameplayoverlaycamera") return true;
+      if (lower == "maincamera") return true;
+    }
+  }
+  return false;
+}
 void SetMultipassShaderState(bool enabled,
                              UnityEngine::XR::XRSettings_StereoRenderingMode stereoMode =
                                  UnityEngine::XR::XRSettings_StereoRenderingMode::MultiPass,
@@ -246,6 +285,10 @@ void SetMultipassShaderStateForCamera(UnityEngine::Camera* camera) {
     SetMultipassShaderState(false);
     return;
   }
+  // Mirror cameras and other non-main cameras MUST NOT touch the global stereo
+  // keyword state. They previously flipped it off/on mid-frame, which is the
+  // root cause of the glitchy offset geometry inside mirrors.
+  if (!IsShaderStateOwnerCamera(camera)) return;
   auto stereoMode = UnityEngine::XR::XRSettings::get_stereoRenderingMode();
   bool const hasCamera = camera != nullptr && UnityEngine::Object::op_Implicit_bool(camera);
   bool const isStereoCamera = hasCamera && camera->get_stereoEnabled() &&
@@ -437,10 +480,10 @@ void FollowedSaberTrail::Cleanup() {
     }
   }
   ____trailRenderer = nullptr;
-  if (_materialPropertyBlock != nullptr) {
-    _materialPropertyBlock->Dispose();
-    _materialPropertyBlock = nullptr;
-  }
+  // NOTE: do not Dispose the MaterialPropertyBlock — Unity destroys managed
+  // MPBs during GC anyway, and disposing here could release a native block
+  // still referenced elsewhere. Dropping our reference is enough.
+  _materialPropertyBlock = nullptr;
   _followed = nullptr;
   _hasLastAppliedColor = false;
 }
@@ -467,7 +510,7 @@ void MultipassKeywordController::OnDisable() {
 namespace {
 constexpr std::string_view kCapability = "Vivify"sv;
 constexpr std::string_view kBundleFile = "bundleAndroid2021.vivify"sv;
-constexpr bool kAllowUnsafeWindowsBundleFallback = true;
+constexpr bool kAllowUnsafeWindowsBundleFallback = false;
 constexpr std::string_view kInstantiatePrefabEvent = "InstantiatePrefab"sv;
 constexpr std::string_view kDestroyObjectEvent = "DestroyObject"sv;
 constexpr std::string_view kSetMaterialPropertyEvent = "SetMaterialProperty"sv;
@@ -488,6 +531,48 @@ constexpr float kMaxTrailDuration = 2.0f;
 constexpr int kMaxTrailSamplingFrequency = 120;
 constexpr int kMaxTrailGranularity = 240;
 constexpr int kGameplayOverlaySortingOrder = 32767;
+// ── Resource safety budgets ─────────────────────────────────────────────
+// Intense Vivify maps (mirrors + several secondary cameras + dozens of prefabs)
+// can exhaust the Quest GPU driver / system memory and hard-crash the game.
+// The budget tracks cumulative render-texture pixels created by this mod so we
+// can refuse new allocations (fail soft, degrade visuals) instead of crashing.
+// Per-category hard caps stop runaway map data from spawning unbounded objects.
+constexpr int64_t kHardTotalPixelBudget = 32ll * 1024 * 1024; // 32M px ≈ 128MB ARGB32
+constexpr int kAbsMaxSecondaryCameras = 8;
+constexpr int kAbsMaxDeclaredTextures = 16;
+constexpr int kAbsMaxLivePrefabs = 128;
+constexpr int kAbsMaxNoteReplacements = 512;
+constexpr int kDefaultPrefabsPerFrame = 4; // pre-instantiation budget per Update tick
+constexpr int kAbsMaxPrefabsPerFrame = 12;
+constexpr int kNoteScrubInterval = 15;     // frames between full note-replacement scrubs
+constexpr int kBlitCacheChangeFrame = 10;  // frames a changed blit set keeps RTs alive
+int64_t EstimatePixels(int width, int height) {
+  int64_t w = std::clamp(width, 1, kMaxRenderTextureSize);
+  int64_t h = std::clamp(height, 1, kMaxRenderTextureSize);
+  return w * h;
+}
+int64_t BytesForPixels(int64_t pixels, UnityEngine::RenderTextureFormat format) {
+  // Rough bytes-per-pixel for the formats this mod actually creates.
+  int bpp = 4; // default ARGB32
+  int const v = format.value__;
+  using F = UnityEngine::RenderTextureFormat;
+  if (v == F::ARGBHalf.value__ || v == F::RGHalf.value__ || v == F::RHalf.value__) {
+    bpp = 8;
+  } else if (v == F::ARGBFloat.value__ || v == F::RGFloat.value__ || v == F::RFloat.value__) {
+    bpp = 16;
+  } else if (v == F::RGB565.value__ || v == F::ARGB4444.value__ || v == F::ARGB1555.value__) {
+    bpp = 2;
+  } else if (v == F::R8.value__) {
+    bpp = 1;
+  }
+  return pixels * bpp;
+}
+bool WarnThrottled(int& counter, int frame) {
+  // Fires at most once per counter and at most 3 unique throttled warnings per frame.
+  if (counter == frame) return false;
+  counter = frame;
+  return true;
+}
 enum class MaterialPropertyKind {
   Unsupported,
   Texture,
@@ -599,6 +684,8 @@ struct SecondaryCameraData {
   UnityEngine::Camera* camera = nullptr;
   UnityEngine::RenderTexture* colorRT = nullptr;
   UnityEngine::RenderTexture* depthRT = nullptr;
+  bool colorRTOwned = false;  // true once the RT pixel budget was charged for colorRT
+  bool depthRTOwned = false;  // true once the RT pixel budget was charged for depthRT
 };
 enum class RenderSettingKind { Float, Color, Bool, Int, Enum, Material, Light };
 struct RenderSettingValue {
@@ -1026,12 +1113,32 @@ public:
   }
   void ReplaceNoteVisuals(GlobalNamespace::NoteController* noteController, std::vector<AssignedPrefabInfo*> const& infos) {
     if (GetDisableCustomNoteVisuals()) return;
+    if (_noteReplacements.size() >= static_cast<size_t>(kAbsMaxNoteReplacements) &&
+        !_noteReplacements.contains(noteController)) {
+      if (WarnThrottled(_warnFrameScrub, _frameCounter)) {
+        PaperLogger.warn(
+            "Vivify resource limit: ignoring note visual replacement — {} notes already replaced (map is assigning prefabs to too many notes)",
+            kAbsMaxNoteReplacements);
+      }
+      return;
+    }
     RestoreNoteVisuals(noteController);
     if (!IsAlive(noteController) || infos.empty()) return;
     UnityEngine::Transform* replacementParent = GetReplacementParent(noteController);
     if (!IsAlive(replacementParent)) return;
     std::vector<AssignedPrefabInfo*> validInfos = GetValidPrefabInfos(infos);
     if (validInfos.empty()) return;
+    // Resource cap: every spawned prefab adds renderers, layers-walks and GPU
+    // objects. Intense maps assign many fragments per note; without a cap the
+    // object count scales with note count and can OOM/crash the Quest.
+    if (validInfos.size() > static_cast<size_t>(EffectiveMaxNoteFragments())) {
+      if (WarnThrottled(_warnFrameFragments, _frameCounter)) {
+        PaperLogger.warn(
+            "Vivify resource limit: capping note visuals at {} fragments (map requested {}) — raise maxNoteVisualFragments in settings if visuals look wrong",
+            EffectiveMaxNoteFragments(), validInfos.size());
+      }
+      validInfos.resize(static_cast<size_t>(EffectiveMaxNoteFragments()));
+    }
 
     VisualReplacement replacement;
     // Respect the map's "additive" flag: hide the stock note mesh when the
@@ -1179,9 +1286,10 @@ public:
     };
   }
   void Update() {
-    // Detect global pause via timescale as a fallback in case the pause menu
-    // doesn't notify Vivify. This ensures blit/post effects and animations
-    // stop while paused.
+    _frameCounter++;
+    // Ignore pause-detection and time checks while resetting — ResetRuntime can
+    // be re-entered from DetectSongRestart/Update mid-tick otherwise.
+    if (_isResetting) return;
     bool const timePaused = UnityEngine::Time::get_timeScale() == 0.0f;
     if (timePaused != _pauseMenuActive) {
       SetPauseMenuActive(timePaused);
@@ -1194,6 +1302,7 @@ public:
       RefreshCameraComponents(false);
       return;
     }
+    if (!_pauseMenuActive) ProcessPrefabWarmQueue();
     UpdateMaterialAnimations();
     UpdateGlobalAnimations();
     UpdateAnimatorAnimations();
@@ -1203,6 +1312,16 @@ public:
     DetectSongRestart();
     SanitizeActiveNoteReplacements();
     UpdateSaberReplacementColors();
+    // Free the full-screen blit targets after the effect chain ends so VRAM
+    // returns to the game. Keep them briefly alive so restarts/beat-on-off
+    // patterns don't thrash allocations.
+    if (!_preEffects.empty() || !_postEffects.empty()) {
+      _lastBlitSetChangedFrame = _frameCounter;
+    } else if (_lastBlitSetChangedFrame > 0 &&
+               _frameCounter - _lastBlitSetChangedFrame > kBlitCacheChangeFrame) {
+      ReleaseCachedBlitTextures();
+      _lastBlitSetChangedFrame = -1;
+    }
   }
   void ApplyBlits(UnityEngine::RenderTexture* src, UnityEngine::RenderTexture* dest) {
     if (!IsAlive(src) || (dest != nullptr && !IsAlive(dest))) return;
@@ -1221,6 +1340,7 @@ public:
       UnityEngine::Graphics::Blit(static_cast<UnityEngine::Texture*>(src), dest);
       return;
     }
+    _lastBlitSetChangedFrame = _frameCounter;
     UnityEngine::Graphics::Blit(static_cast<UnityEngine::Texture*>(src), main);
     auto* mainCurrent = main;
     auto* mainScratch = scratch;
@@ -1275,13 +1395,22 @@ public:
       }
       ReleaseRenderTexture(texture);
     }
+    if (!TryReserveRTPixels(desc.get_width(), desc.get_height(), UnityEngine::RenderTextureFormat::ARGB32, "blit")) {
+      return nullptr;
+    }
     texture = UnityEngine::RenderTexture::New_ctor(desc);
-    if (!IsAlive(texture)) { texture = nullptr; return nullptr; }
+    if (!IsAlive(texture)) {
+      _rtPixelsUsed -= EstimatePixels(desc.get_width(), desc.get_height());
+      if (_rtPixelsUsed < 0) _rtPixelsUsed = 0;
+      texture = nullptr;
+      return nullptr;
+    }
     if (!texture->Create()) { ReleaseRenderTexture(texture); return nullptr; }
     return texture;
   }
   void ReleaseRenderTexture(UnityEngine::RenderTexture*& texture) {
     if (IsAlive(texture)) {
+      ReleaseRTPixels(texture);
       texture->Release();
       UnityEngine::Object::Destroy(texture);
     }
@@ -1330,12 +1459,11 @@ public:
     if (GetDisableAllBlits()) {
       if ((!_preEffects.empty() || !_postEffects.empty()) && GetVivifyDebugLogging()) {
         PaperLogger.info("Vivify isolation: clearing active blits pre={} post={}", _preEffects.size(), _postEffects.size());
-      }
-      _preEffects.clear();
-      _postEffects.clear();
-      ReleaseCachedBlitTextures();
-      DestroyCameraApplier();
-    } else if (GetDisableBeat0FilmgrainBlit()) {
+      }    _preEffects.clear();
+    _postEffects.clear();
+    ReleaseCachedBlitTextures();
+    DestroyCameraApplier();
+  } else if (GetDisableBeat0FilmgrainBlit()) {
       UpdateBlitEffects();
     }
 
@@ -1347,6 +1475,10 @@ public:
         ReleaseSecondaryCameraData(camera);
       }
       _secondaryCameras.clear();
+      for (auto& [name, dt] : _declaredTextures) {
+        ReleaseDeclaredTextureData(dt);
+      }
+      _declaredTextures.clear();
       for (auto it = _cameraProperties.begin(); it != _cameraProperties.end();) {
         if (it->first != "_Main") {
           it = _cameraProperties.erase(it);
@@ -1472,7 +1604,15 @@ private:
                                  _currentBeatmapData != nullptr && !_isResetting && !_pauseMenuActive);
     if (IsAlive(mainCam)) {
       if (auto props = _cameraProperties.find("_Main"); props != _cameraProperties.end()) {
-        ApplyCameraProperties(mainCam.unsafePtr(), props->second);
+        // ApplyCameraProperties issues ~5 il2cpp setter calls per camera; the
+        // properties only change when a SetCameraProperty event fires and the
+        // scene camera object changes rarely. Re-apply only when something
+        // actually changed instead of every frame.
+        if (_cameraPropsAppliedGeneration != _cameraPropsGeneration || _cameraPropsAppliedGO != mainCamGO) {
+          ApplyCameraProperties(mainCam.unsafePtr(), props->second);
+          _cameraPropsAppliedGeneration = _cameraPropsGeneration;
+          _cameraPropsAppliedGO = mainCamGO;
+        }
       }
     }
     RefreshCameraApplier(mainCamGO, allowCameraApplier);
@@ -1516,7 +1656,8 @@ private:
   }
   void RefreshGameplayOverlayCamera(UnityEngine::Camera* mainCam, UnityEngine::GameObject* mainCamGO, bool allowOverlay) {
     int const mask = GameplayOverlayLayerMask();
-    if (!allowOverlay || mask == 0 || !IsAlive(mainCam) || !IsAlive(mainCamGO)) {
+    if (!allowOverlay || mask == 0 || !IsAlive(mainCam) || !IsAlive(mainCamGO) ||
+        (ShouldDisableVisualsForMultiplayer() && _gameplayOverlayCamera == nullptr)) {
       DestroyGameplayOverlayCamera();
       return;
     }
@@ -1530,6 +1671,8 @@ private:
         _gameplayOverlayCamera = nullptr;
         return;
       }
+      _overlayCopiedFromGO = nullptr;
+      _overlayConfigured = false;
     }
 
     auto* overlayGO = _gameplayOverlayCamera->get_gameObject().unsafePtr();
@@ -1538,14 +1681,28 @@ private:
       return;
     }
     overlayGO->get_transform()->SetParent(mainCamGO->get_transform(), false);
-    _gameplayOverlayCamera->CopyFrom(mainCam);
-    _gameplayOverlayCamera->set_clearFlags(UnityEngine::CameraClearFlags::Depth);
-    _gameplayOverlayCamera->set_cullingMask(mask);
-    _gameplayOverlayCamera->set_depth(mainCam->get_depth() + 1000.0f);
-    _gameplayOverlayCamera->set_targetTexture(nullptr);
-    _gameplayOverlayCamera->set_stereoTargetEye(mainCam->get_stereoTargetEye());
+    // CopyFrom is expensive (dozens of il2cpp calls) and the main camera's
+    // parameters only change when the scene camera object changes — not per
+    // frame. Re-copy only when the source camera object differs.
+    if (_overlayCopiedFromGO != mainCamGO) {
+      _gameplayOverlayCamera->CopyFrom(mainCam);
+      _overlayCopiedFromGO = mainCamGO;
+      _overlayConfigured = false;
+    }
+    if (!_overlayConfigured) {
+      _gameplayOverlayCamera->set_clearFlags(UnityEngine::CameraClearFlags::Depth);
+      _gameplayOverlayCamera->set_depth(mainCam->get_depth() + 1000.0f);
+      _gameplayOverlayCamera->set_targetTexture(nullptr);
+      _gameplayOverlayCamera->set_stereoTargetEye(mainCam->get_stereoTargetEye());
+      _overlayConfigured = true;
+    }
     EnsureMultipassKeywordController(overlayGO);
-    _gameplayOverlayCamera->set_enabled(true);
+    if (_gameplayOverlayCamera->get_cullingMask() != mask) {
+      _gameplayOverlayCamera->set_cullingMask(mask);
+    }
+    if (!_gameplayOverlayCamera->get_enabled()) {
+      _gameplayOverlayCamera->set_enabled(true);
+    }
   }
   void DestroyGameplayOverlayCamera() {
     if (_gameplayOverlayCamera != nullptr && UnityEngine::Object::op_Implicit_bool(_gameplayOverlayCamera)) {
@@ -1558,6 +1715,8 @@ private:
       }
     }
     _gameplayOverlayCamera = nullptr;
+    _overlayCopiedFromGO = nullptr;
+    _overlayConfigured = false;
   }
   std::string ResolveLocalAndroidBundlePath(std::string const& levelPath) const {
     static constexpr std::string_view candidates[] = {
@@ -1586,7 +1745,7 @@ private:
   std::string ResolveLocalQuestBundlePath(std::string const& levelPath) const {
     std::string androidPath = ResolveLocalAndroidBundlePath(levelPath);
     if (std::filesystem::exists(androidPath)) return androidPath;
-    if constexpr (kAllowUnsafeWindowsBundleFallback) {
+    if (kAllowUnsafeWindowsBundleFallback || _allowWindowsBundleFallback) {
       std::string windowsPath = ResolveUnsupportedWindowsBundlePath(levelPath);
       if (!windowsPath.empty()) return windowsPath;
     }
@@ -1616,6 +1775,7 @@ private:
     ResetRuntime();
     _selectedLevelPath.clear();
     _selectedMapHasVivifyRequirement = false;
+    _allowWindowsBundleFallback = false;
     if (!event.isCustom || event.customBeatmapLevel == nullptr) {
       return;
     }
@@ -1632,6 +1792,11 @@ private:
     }
     if (_selectedMapHasVivifyRequirement) {
       MetaCore::Game::SetScoreSubmission("Vivify", false);
+      // This fork runs Windows-authored bundles through shader repair as a
+      // best-effort fallback; it is off by default (it is a genuine crash
+      // vector) and can be re-enabled in the mod config for maps that have no
+      // Android bundle at all.
+      _allowWindowsBundleFallback = GetAllowWindowsBundleFallback();
       std::string bundlePath = ResolveLocalQuestBundlePath(_selectedLevelPath);
       bool bundleExists = std::filesystem::exists(bundlePath);
       if (!bundleExists) {
@@ -1786,29 +1951,7 @@ private:
       PaperLogger.info("Vivify custom event: type='{}' beat={} songTime={}",
                        std::string(type), customEventData->time, CurrentSongTime());
     }
-    if (type == kInstantiatePrefabEvent) {
-      InstantiatePrefab(customEventData, *json);
-    } else if (type == kDestroyObjectEvent) {
-      DestroyObjects(*json);
-    } else if (type == kSetMaterialPropertyEvent) {
-      HandleSetMaterialProperty(customEventData, *json);
-    } else if (type == kSetAnimatorPropertyEvent) {
-      HandleSetAnimatorProperty(customEventData, *json);
-    } else if (type == kSetGlobalPropertyEvent) {
-      HandleSetGlobalProperty(customEventData, *json);
-    } else if (IsPostProcessingEvent(type)) {
-      HandleBlit(customEventData, *json);
-    } else if (type == kCreateCameraEvent) {
-      HandleCreateCamera(*json);
-    } else if (type == kCreateScreenTextureEvent) {
-      HandleCreateScreenTexture(*json);
-    } else if (type == kSetCameraPropertyEvent) {
-      HandleSetCameraProperty(*json);
-    } else if (type == kSetRenderingSettingsEvent) {
-      HandleSetRenderingSettings(customEventData, *json);
-    } else if (type == kAssignObjectPrefabEvent) {
-      HandleAssignObjectPrefab(customEventData, *json);
-    }
+    DispatchEvent(customEventData, type, *json);
   }
   CustomJSONData::CustomBeatmapData* GetCustomBeatmapData(GlobalNamespace::BeatmapCallbacksController* callbackController) {
     if (callbackController == nullptr) return nullptr;
@@ -1859,31 +2002,7 @@ private:
       if (GetVivifyDebugLogging()) {
         PaperLogger.info("Vivify catch-up event: type='{}' beat={}", std::string(type), customEventData->time);
       }
-      if (type == kInstantiatePrefabEvent) {
-        InstantiatePrefab(customEventData, *json);
-      } else if (type == kDestroyObjectEvent) {
-        DestroyObjects(*json);
-      } else if (type == kSetMaterialPropertyEvent) {
-        HandleSetMaterialProperty(customEventData, *json);
-      } else if (type == kSetAnimatorPropertyEvent) {
-        HandleSetAnimatorProperty(customEventData, *json);
-      } else if (type == kSetGlobalPropertyEvent) {
-        HandleSetGlobalProperty(customEventData, *json);
-      } else if (IsPostProcessingEvent(type)) {
-        HandleBlit(customEventData, *json);
-      } else if (type == kCreateCameraEvent) {
-        HandleCreateCamera(*json);
-      } else if (type == kCreateScreenTextureEvent) {
-        HandleCreateScreenTexture(*json);
-      } else if (type == kSetCameraPropertyEvent) {
-        HandleSetCameraProperty(*json);
-      } else if (type == kSetRenderingSettingsEvent) {
-        HandleSetRenderingSettings(customEventData, *json);
-      } else if (type == kAssignObjectPrefabEvent) {
-        HandleAssignObjectPrefab(customEventData, *json);
-      } else {
-        continue;
-      }
+      DispatchEvent(customEventData, type, *json);
       // Mark as applied so HandleCustomEvent skips it when BeatmapCallbacksController
       // re-fires it at its natural beat time. Without this, every caught-up event
       // would double-fire: once here, once from BCC.
@@ -1912,13 +2031,17 @@ private:
       }
     }
     for (auto& [eventData, instantiate] : _instantiatePrefabs) {
-      if (instantiate.instance != nullptr && destroyed.emplace(instantiate.instance).second) {
-        if (UnityEngine::Object::op_Implicit_bool(instantiate.instance)) {
+      if (instantiate.instance != nullptr) {
+        if (destroyed.emplace(instantiate.instance).second &&
+            UnityEngine::Object::op_Implicit_bool(instantiate.instance)) {
           UnityEngine::Object::Destroy(instantiate.instance);
         }
+        instantiate.instance = nullptr;
+        if (_warmInstanceCount > 0) --_warmInstanceCount;
       }
-      instantiate.instance = nullptr;
     }
+    _prefabWarmQueue.clear();
+    _prefabWarmCursor = 0;
     _livePrefabs.clear();
     _instantiatePrefabs.clear();
     _materialAnimations.clear();
@@ -1952,16 +2075,19 @@ private:
     _assetPaths.clear();
     _cameraProperties.clear();
     _cameraCullingLayers.clear();
-    // Keep _mainBundle loaded so the next LoadMainBundle call for the same map
-    // (e.g. Practice mode restart) is instant. LoadMainBundle checks
-    // _preloadedBundlePath and skips the blocking AssetBundle::LoadFromFile when
-    // the bundle is already in memory. Asset caches (_assets, _assetsByName etc.)
-    // are already cleared above and will be rebuilt on the next LoadMainBundle.
-    // Only unload if the bundle is somehow null/dead.
+    // Keep the asset bundle itself loaded so the next LoadMainBundle call for
+    // the same map (Practice-mode restart, quick retry) is instant and does not
+    // re-deserialize every asset. Asset caches (_assets, _assetsByName etc.)
+    // are already cleared above and are rebuilt lazily by LoadMainBundle.
     if (_mainBundle != nullptr && !UnityEngine::Object::op_Implicit_bool(_mainBundle)) {
       _mainBundle = nullptr;
       _preloadedBundlePath.clear();
     }
+    _rtPixelsUsed = 0; // all RTs owned by the runtime were released above
+    _cameraPropsAppliedGeneration = -1;
+    _cameraPropsAppliedGO = nullptr;
+    _overlayCopiedFromGO = nullptr;
+    _overlayConfigured = false;
     _currentBeatmapData = nullptr;
     _beatmapAD = nullptr;
     _audioTimeSyncController = nullptr;
@@ -2024,6 +2150,7 @@ private:
       }
       if (!key.empty() && !_assetPaths.contains(key)) _assetPaths[key] = originalAssetPath;
     }
+    RepairLoadedMaterialShaders();
   }
   void LoadMainBundle() {
     LogUnityPlatformInfoOnce();
@@ -2042,6 +2169,15 @@ private:
     // here even though the bundle object is already in memory.
     if (!_preloadedBundlePath.empty() && _preloadedBundlePath == bundlePath &&
         _mainBundle != nullptr && UnityEngine::Object::op_Implicit_bool(_mainBundle)) {
+      if (!_assets.empty()) {
+        // Warm restart (practice mode / quick retry): the bundle is still in
+        // memory and its asset caches were already populated — reuse them
+        // instead of re-deserializing every asset a second time.
+        if (GetVivifyDebugLogging()) {
+          PaperLogger.info("Vivify bundle warm reuse: '{}' assets={}", bundlePath, _assets.size());
+        }
+        return;
+      }
       if (GetVivifyDebugLogging()) {
         PaperLogger.info("Vivify bundle preloaded, rebuilding asset caches: '{}'", bundlePath);
       }
@@ -2052,7 +2188,7 @@ private:
         std::string key = NormalizeAssetKey(originalAssetPath);
         _assetPaths[key] = originalAssetPath;
         auto asset = _mainBundle->LoadAsset(assetName);
-        if (asset == nullptr) continue;
+        if (asset == nullptr) continue; // failed asset must not poison the whole load
         _assets[key] = asset;
         auto name = asset->get_name();
         if (name) {
@@ -2066,6 +2202,7 @@ private:
           }
         }
       }
+      RepairLoadedMaterialShaders();
       return;
     }
     if (GetVivifyDebugLogging()) {
@@ -2185,6 +2322,46 @@ private:
   }
   bool IsAlive(UnityEngine::Object* object) const {
     return object != nullptr && UnityEngine::Object::op_Implicit_bool(object);
+  }
+
+  // ── Resource budget helpers ────────────────────────────────────────────
+  int64_t EffectivePixelBudget() const {
+    if (!GetSafeModeLimits()) return kHardTotalPixelBudget;
+    int64_t configured = GetMaxTotalPixels();
+    return std::clamp<int64_t>(configured, 512 * 1024, kHardTotalPixelBudget);
+  }
+  int EffectiveMaxPrefabs() const {
+    return GetSafeModeLimits() ? std::clamp(GetMaxActivePrefabs(), 8, kAbsMaxLivePrefabs) : kAbsMaxLivePrefabs;
+  }
+  int EffectiveMaxNoteFragments() const {
+    return GetSafeModeLimits() ? std::clamp(GetMaxNoteVisualFragments(), 1, 64) : 64;
+  }
+  int EffectivePrefabsPerFrame() const {
+    return GetSafeModeLimits() ? kDefaultPrefabsPerFrame : kAbsMaxPrefabsPerFrame;
+  }
+  // Try to reserve pixels for a new RT. Returns false (and warns once per frame)
+  // when the budget would be exceeded.
+  bool TryReserveRTPixels(int width, int height, UnityEngine::RenderTextureFormat format, std::string_view context) {
+    int64_t const pixels = EstimatePixels(width, height);
+    int64_t const bytes = BytesForPixels(pixels, format);
+    int64_t const budget = EffectivePixelBudget();
+    if (_rtPixelsUsed + pixels > budget) {
+      if (WarnThrottled(_warnFrameBudget, _frameCounter)) {
+        PaperLogger.warn(
+            "Vivify resource budget: refusing {} RT ({}x{} fmt={} ~{}MB): would exceed {}MB budget (used {}MB) — failing soft to keep the game alive",
+            context, width, height, format.value__, bytes / (1024 * 1024), budget / (1024 * 1024),
+            _rtPixelsUsed / (1024 * 1024));
+      }
+      return false;
+    }
+    _rtPixelsUsed += pixels;
+    return true;
+  }
+  void ReleaseRTPixels(UnityEngine::RenderTexture* texture) {
+    if (!IsAlive(texture)) return;
+    auto desc = texture->get_descriptor();
+    _rtPixelsUsed -= EstimatePixels(desc.get_width(), desc.get_height());
+    if (_rtPixelsUsed < 0) _rtPixelsUsed = 0;
   }
 
   // Return true if a well-known multiplayer mod is loaded (MultiplayerCore)
@@ -2420,6 +2597,7 @@ private:
   }
   void ReleaseDeclaredTextureData(DeclaredTextureData& data) {
     if (IsAlive(data.texture)) {
+      ReleaseRTPixels(data.texture);
       data.texture->Release();
       UnityEngine::Object::Destroy(data.texture);
     }
@@ -2433,15 +2611,22 @@ private:
       UnityEngine::Shader::SetGlobalTexture(data.depthTexturePropertyId.value(), static_cast<UnityEngine::Texture*>(nullptr));
     }
     if (IsAlive(data.colorRT)) {
+      if (data.colorRTOwned) ReleaseRTPixels(data.colorRT);
       data.colorRT->Release();
       UnityEngine::Object::Destroy(data.colorRT);
     }
     if (IsAlive(data.depthRT)) {
+      if (data.depthRTOwned) ReleaseRTPixels(data.depthRT);
       data.depthRT->Release();
       UnityEngine::Object::Destroy(data.depthRT);
     }
     if (IsAlive(data.camera)) {
       UnityEngine::Object::Destroy(data.camera->get_gameObject());
+    } else if (data.camera != nullptr) {
+      auto camGO = data.camera->get_gameObject();
+      auto* camGOPtr = camGO ? camGO.unsafePtr() : nullptr;
+      if (IsAlive(camGOPtr)) UnityEngine::Object::Destroy(camGOPtr);
+      UnityEngine::Object::Destroy(data.camera);
     }
     data.colorRT = nullptr;
     data.depthRT = nullptr;
@@ -2822,7 +3007,7 @@ private:
     auto* prefab = GetAssetAs<UnityEngine::GameObject>(info.asset);
     if (prefab == nullptr || !UnityEngine::Object::op_Implicit_bool(prefab)) return;
     auto* spawned = UnityEngine::Object::Instantiate(prefab);
-    if (!IsAlive(spawned)) return;
+    if (!IsAlive(spawned)) return; // Instantiate returned null (OOM/destroyed prefab) — do not deref
     CleanCustomObject(spawned);
     RepairGameObjectMaterials(spawned, info.asset);
     auto* spawnedTransform = SafeUnityPtr(spawned->get_transform());
@@ -2840,25 +3025,28 @@ private:
         SetLayerRecursively(spawned, parentGO->get_layer());
       }
     }
-    CleanCustomObject(spawned);
-    if (overrideLayer >= 0) {
-      SetLayerRecursively(spawned, overrideLayer);
-    }
     replacement.spawnedObjects.emplace_back(spawned);
     CacheReplacementRenderers(spawned, replacement);
   }
   void SanitizeActiveNoteReplacements() {
     if (_noteReplacements.empty()) return;
+    // Component sweeps (5+ GetComponentsInChildren calls per note, every frame)
+    // are mostly overhead when nothing changed. Do the dead-controller cleanup
+    // every frame (cheap), but the full CleanCustomObject/layer scrub only
+    // every 15 frames — replacement objects' components don't change after spawn.
+    bool const fullScrub = (_frameCounter % kNoteScrubInterval) == 0;
     for (auto it = _noteReplacements.begin(); it != _noteReplacements.end();) {
       if (!IsAlive(it->first)) {
         RestoreReplacementData(it->second);
         it = _noteReplacements.erase(it);
         continue;
       }
-      for (auto* spawned : it->second.spawnedObjects) {
-        if (!IsAlive(spawned)) continue;
-        CleanCustomObject(spawned);
-        SetLayerRecursively(spawned, kVisualOnlyLayer);
+      if (fullScrub) {
+        for (auto* spawned : it->second.spawnedObjects) {
+          if (!IsAlive(spawned)) continue;
+          CleanCustomObject(spawned);
+          SetLayerRecursively(spawned, kVisualOnlyLayer);
+        }
       }
       ++it;
     }
@@ -3049,6 +3237,14 @@ private:
       return;
     }
     bool const v2 = _currentBeatmapData->v2orEarlier;
+    // Parse every InstantiatePrefab event now (cheap — pure JSON work) but do
+    // NOT call Object::Instantiate here. Vivify maps commonly declare dozens of
+    // prefabs (env objects, mirrors, particles) and instantiating them all in
+    // one frame on the first event caused a multi-second hitch right at song
+    // start. The GameObject::Instantiate calls are spread across Update() via
+    // ProcessPrefabWarmQueue instead.
+    _prefabWarmQueue.clear();
+    _prefabWarmCursor = 0;
     std::unordered_set<std::string> seenIds;
     for (auto* customEventData : _currentBeatmapData->customEventDatas) {
       if (customEventData == nullptr || customEventData->type != kInstantiatePrefabEvent) {
@@ -3071,11 +3267,34 @@ private:
       }
       data.transformData = Tracks::TransformData(*json, v2);
       data.tracks = ReadTracks(*json, v2);
-      if (auto* prefab = GetAssetAs<UnityEngine::GameObject>(data.asset); prefab != nullptr) {
-        data.instance = UnityEngine::Object::Instantiate(prefab);
-        data.instance->SetActive(false);
+      auto [it, inserted] = _instantiatePrefabs.emplace(customEventData, std::move(data));
+      if (inserted) {
+        _prefabWarmQueue.emplace_back(customEventData, &it->second);
       }
-      _instantiatePrefabs.emplace(customEventData, std::move(data));
+    }
+  }
+  void ProcessPrefabWarmQueue() {
+    if (_prefabWarmCursor >= _prefabWarmQueue.size()) return;
+    int const budget = EffectivePrefabsPerFrame();
+    int instantiated = 0;
+    while (_prefabWarmCursor < _prefabWarmQueue.size() && instantiated < budget) {
+      auto [eventData, data] = _prefabWarmQueue[_prefabWarmCursor++];
+      if (data->instance == nullptr) {
+        auto* prefab = GetAssetAs<UnityEngine::GameObject>(data->asset);
+        if (prefab != nullptr && UnityEngine::Object::op_Implicit_bool(prefab) &&
+            _livePrefabs.size() + _warmInstanceCount < static_cast<size_t>(EffectiveMaxPrefabs())) {
+          data->instance = UnityEngine::Object::Instantiate(prefab);
+          if (data->instance != nullptr) {
+            data->instance->SetActive(false);
+            ++_warmInstanceCount;
+          }
+        }
+      }
+      instantiated++;
+    }
+    if (_prefabWarmCursor >= _prefabWarmQueue.size()) {
+      _prefabWarmQueue.clear();
+      _prefabWarmCursor = 0;
     }
   }
   std::string GetPrefabStorageId(CustomJSONData::CustomEventData* customEventData,
@@ -3091,17 +3310,31 @@ private:
       return;
     }
     auto& data = it->second;
+    bool const wasWarm = data.instance != nullptr;
     if (data.instance == nullptr) {
       auto* prefab = GetAssetAs<UnityEngine::GameObject>(data.asset);
       if (prefab == nullptr) {
         return;
       }
+      if (_livePrefabs.size() >= static_cast<size_t>(EffectiveMaxPrefabs())) {
+        if (WarnThrottled(_warnFramePrefabs, _frameCounter)) {
+          PaperLogger.warn(
+              "Vivify resource limit: refusing InstantiatePrefab for asset '{}' — {} prefabs already active (cap prevents unbounded memory/CPU growth)",
+              data.asset, EffectiveMaxPrefabs());
+        }
+        return;
+      }
       data.instance = UnityEngine::Object::Instantiate(prefab);
+      if (data.instance == nullptr) return;
       data.instance->SetActive(false);
+      ++_warmInstanceCount;
     }
     std::string storageId = GetPrefabStorageId(customEventData, data);
     if (_livePrefabs.contains(storageId)) {
       DestroyPrefabById(storageId);
+    }
+    if (wasWarm && _warmInstanceCount > 0) {
+      --_warmInstanceCount;
     }
     auto* instance = data.instance;
     instance->SetActive(true);
@@ -3158,8 +3391,7 @@ private:
   }
   void DestroyObjects(rapidjson::Value const& json) {
     for (auto const& id : ReadStringListOrSingle(json, "id")) {
-      if (!DestroyPrefabById(id)) {
-      }
+      DestroyPrefabById(id);
     }
   }
   float CurrentSongTime() {
@@ -3730,6 +3962,43 @@ private:
     _animatorAnimations.erase(write, _animatorAnimations.end());
   }
 #include "VivifyNewHandlers.inl"
+  // Safety wrapper used by both dispatch paths (live events and catch-up):
+  // one malformed/unexpected event must not unwind through the hook into the
+  // game (mod-side try/catch, not the runtime's fragile catch-rethrow).
+  void DispatchEvent(CustomJSONData::CustomEventData* customEventData, std::string_view type,
+                     rapidjson::Value const& json) {
+    try {
+      if (type == kInstantiatePrefabEvent) {
+        InstantiatePrefab(customEventData, json);
+      } else if (type == kDestroyObjectEvent) {
+        DestroyObjects(json);
+      } else if (type == kSetMaterialPropertyEvent) {
+        HandleSetMaterialProperty(customEventData, json);
+      } else if (type == kSetAnimatorPropertyEvent) {
+        HandleSetAnimatorProperty(customEventData, json);
+      } else if (type == kSetGlobalPropertyEvent) {
+        HandleSetGlobalProperty(customEventData, json);
+      } else if (IsPostProcessingEvent(type)) {
+        HandleBlit(customEventData, json);
+      } else if (type == kCreateCameraEvent) {
+        HandleCreateCamera(json);
+      } else if (type == kCreateScreenTextureEvent) {
+        HandleCreateScreenTexture(json);
+      } else if (type == kSetCameraPropertyEvent) {
+        HandleSetCameraProperty(json);
+      } else if (type == kSetRenderingSettingsEvent) {
+        HandleSetRenderingSettings(customEventData, json);
+      } else if (type == kAssignObjectPrefabEvent) {
+        HandleAssignObjectPrefab(customEventData, json);
+      }
+    } catch (std::exception const& ex) {
+      PaperLogger.error("Vivify event dispatch failed: type='{}' beat={} error={}",
+                        std::string(type), customEventData ? customEventData->time : -1.0f, ex.what());
+    } catch (...) {
+      PaperLogger.error("Vivify event dispatch failed: type='{}' beat={} error=unknown",
+                        std::string(type), customEventData ? customEventData->time : -1.0f);
+    }
+  }
   void RestoreGlobalProperties() {
     for (auto const& [propertyId, value] : _savedGlobalProperties) {
       if (std::holds_alternative<UnityEngine::Texture*>(value)) {
@@ -3807,6 +4076,27 @@ private:
   bool _loggedUnityPlatformInfo = false;
   bool _pauseMenuActive = false;
   bool _isResetting = false;
+  bool _allowWindowsBundleFallback = false;
+  // ── Resource budget state ──────────────────────────────────────────────
+  int64_t _rtPixelsUsed = 0;                 // cumulative pixels of RTs we own
+  int _warnFrameBudget = -1;                 // throttle: one budget warning per frame
+  int _warnFramePrefabs = -1;
+  int _warnFrameCameras = -1;
+  int _warnFrameTextures = -1;
+  int _warnFrameFragments = -1;
+  int _warnFrameScrub = -1;
+  int _frameCounter = 0;                     // increments each RuntimeBehaviour Update
+  int _lastBlitSetChangedFrame = -1;
+  // Deferred per-frame pre-instantiation queue (keeps song start hitch-free).
+  std::vector<std::pair<CustomJSONData::CustomEventData*, InstantiatePrefabData*>> _prefabWarmQueue;
+  size_t _prefabWarmCursor = 0;
+  int _warmInstanceCount = 0; // inactive pooled instances currently alive
+  // Camera-property / overlay-camera apply caching (see RefreshCameraComponents).
+  int _cameraPropsGeneration = 0;
+  int _cameraPropsAppliedGeneration = -1;
+  UnityEngine::GameObject* _cameraPropsAppliedGO = nullptr;
+  UnityEngine::GameObject* _overlayCopiedFromGO = nullptr;
+  bool _overlayConfigured = false;
 };
 }
 MAKE_HOOK_MATCH(SaberModelController_Init, &GlobalNamespace::SaberModelController::Init, void, GlobalNamespace::SaberModelController* self, UnityEngine::Transform* parent, GlobalNamespace::Saber* saber, UnityEngine::Color trailTintColor) {

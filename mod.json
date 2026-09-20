@@ -5,10 +5,10 @@
   "id": "vivify",
   "modloader": "Scotland2",
   "author": "Braxed",
-  "version": "0.4.11",
+  "version": "0.4.14",
   "packageId": "com.beatgames.beatsaber",
   "packageVersion": "1.40.8_7379",
-  "description": "Vivify Port from Axolotl, Built and Fixed By Braxed - visual-only note replacement fallback",
+  "description": "Vivify Port from Axolotl, Built and Fixed By Braxed - perf + mirror fix + resource safety limits",
   "dependencies": [
     {
       "version": "^6.4.2",

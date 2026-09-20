@@ -2,12 +2,12 @@
   "_QPVersion": "0.1.1",
   "id": "${mod_id}",
   "name": "Vivify2",
-  "version": "0.4.11",
+  "version": "0.4.14",
   "author": "Braxed",
   "modloader": "Scotland2",
   "packageId": "com.beatgames.beatsaber",
   "packageVersion": "1.40.8_7379",
-  "description": "Vivify Port from Axolotl, Built and Fixed By Braxed - visual-only note replacement fallback",
+  "description": "Vivify Port from Axolotl, Built and Fixed By Braxed - perf + mirror fix + resource safety limits",
   "modFiles": [],
   "lateModFiles": [
     "libVivify.so"
@@ -48,6 +48,16 @@
       "version": "^4.6.4",
       "id": "paper2_scotland2",
       "downloadIfMissing": "https://github.com/Fernthedev/paperlog/releases/download/v4.7.0/paper2_scotland2.qmod"
+    },
+    {
+      "version": "*",
+      "id": "web-utils",
+      "downloadIfMissing": "https://github.com/bsq-ports/WebUtils/releases/download/v0.6.8/WebUtils.qmod"
+    },
+    {
+      "version": "^1.0.3",
+      "id": "metacore",
+      "downloadIfMissing": "https://github.com/Metalit/MetaCore/releases/download/v1.6.3/MetaCore.qmod"
     }
   ],
   "fileCopies": []

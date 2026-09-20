@@ -1,8 +1,10 @@
 # YOU SHOULD NOT MANUALLY EDIT THIS FILE, QPM WILL VOID ALL CHANGES
 # Version defines, pretty useful
-set(MOD_VERSION "0.4.13")
+set(MOD_VERSION "0.4.14")
 # take the mod name and just remove spaces, that will be MOD_ID, if you don't like it change it after the include of this file
 set(MOD_ID "Vivify")
+# Performance/resource-safety release: mirror stereo fix, RT budgets, prefab caps.
+# Bump when changing gameplay-affecting behavior.
 
 # derived from override .so name or just id_version
 set(COMPILE_ID "vivify")

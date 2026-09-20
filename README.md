@@ -1,45 +1,69 @@
-
 # Vivify Quest Port
 ------
-## Instructions for building the project yourself
-(You can build your own .qmod, just make sure to give credit if distributing)
 
-## Requirements for build
-* [Quest Package Manager](https://github.com/sc2ad/QuestPackageManager) (QPM)
+## What's new in this build (0.4.14)
 
-### To build:
+* **Mirror glitch fix** — Beat Saber's mirror cameras were flipping the global
+  stereo shader keywords every frame (Left eye → Right eye → ...), which is what
+  caused the offset/glitchy geometry inside mirrors. Only the main camera is
+  allowed to drive stereo keyword state now.
+* **Resource safety limits** — heavy maps can no longer exhaust the Quest and
+  crash the game. Render-texture memory is budgeted (~8M px by default,
+  hard-capped at 32M px), secondary cameras are capped at 8, screen textures at
+  16, live prefabs at 96, and note-visual fragments per note at 12. When a map
+  exceeds a cap the mod fails soft (drops that visual) and logs a warning
+  instead of crashing.
+* **Smoother song start** — prefab pre-instantiation is spread across frames
+  (4/frame) instead of one huge hitch when the first event fires.
+* **Faster restarts** — practice-mode / quick-retry restarts reuse the already
+  loaded bundle and warm asset caches instead of re-deserializing everything.
+* **Lower per-frame overhead** — camera property writes, overlay camera setup
+  and note-replacement component scrubbing are cached/throttled instead of
+  running full tilt every frame.
+* **Crash hardening** — all Vivify custom events are dispatched inside a
+  try/catch (a malformed event logs an error instead of crashing the game), and
+  several destroyed-object / null-instance edge cases were fixed.
+* **New settings toggles** — "Safe Mode Limits" (limits on/off) and "Allow
+  Windows bundles" (risky fallback for maps with no Android bundle; off by
+  default). "Disable Custom Vivify Note Visuals" now actually works.
+
+## Installation For Making Your Own
+(You can make your own. give credits down below)
+
+This is How To Build it
+
 ```
 qpm restore
 qpm s build
 qpm s qmod
 ```
 
-If you have QPM installed but throws an error, use `.\qpm` instead
+If it says "qpm is not recognized" then you don't have qpm. if it says pwsh is not avaiable. then change the script commands in qpm.json and in scripts to powershell. OR get latest powershell.
 
-## Installation
+If you do have QPM installed but still gives an error. do .\qpm (with a .\ in it)
 
-*For the best experience, mod your game using [ModsBeforeFriday](https://mbf.bsquest.xyz/) on version 1.40.8*
+## How to install it onto your quest.
 
-*A [tutorial](https://bsmg.wiki/quest/modding-with-mbf.html) by the Beat Saber Modding Group (BSMG)'s wiki for those who are new to this*
-### Through ModsBeforeFriday (MBF)
-1. Download the latest `vivify.qmod` file from the **Releases** tab, or build it yourself as shown above.
-2. Once your headset is modded, connect it to your computer and drag and drop `vivify.qmod` into MBF.
-3. Alternatively, click the **ADD FILES** button and select the `.qmod` file.
-4. Safely disconnect your headset, then launch Beat Saber.
+Most People don't know how to install it when they are new. this is a tutorial.
 
-## .qmod Dependencies
-**MOST OF THESE ARE CORE MODS INSTALLED WHEN YOU MOD USING MBF. INSTALL ANY MISSING MODS.**
-* [beatsaber-hook](https://github.com/QuestPackageManager/beatsaber-hook)
-* [custom-types](https://github.com/QuestPackageManager/Il2CppQuestTypePatching/)
+Go onto [ModsBeforeFriday](https://mbf.bsquest.xyz/) And connect your quest to your PC (Via ADB).
+Now you have to own beatsaber and have it installed. if you do not own beatsaber you need to buy it on quest. if you do not have it installed. please install it before continuing.
+Now if you have beatsaber installed and own beatsaber. you are gonna let MBF connect to your quest. it might give a warning. but you are gonna select 1.40.8 as the modded version. (BEST MODDED VERSION RIGHT NOW) and accept. now its gonna take 10 - 20 minutes for MBF to finish. (might take longer depending on your wifi) Now when MBF says app is modded. you can install any mod you want. (Get Chroma, NE, and ME, For best gameplay on maps.) and after you do so. just go to where vivify.qmod is. then drag and drop it into MBF. or click "ADD FILES" then select the .qmod
+
+## Dependencies
+(For the .qmod)
+
+* beatsaber-hook
+* custom-types
 * custom-json-data
 * tracks
-* [bsml](https://github.com/bsq-ports/Quest-BSML/)
-* [songcore](https://github.com/raineaeternal/Quest-SongCore/)
-* [paper2_scotland2](https://github.com/Fernthedev/paperlog/)
+* bsml
+* songcore
+* paper2_scotland2
 * web-utils
-* [metacore](https://github.com/Fernthedev/paperlog/)
+* metacore
 
-## Project dependencies (in qpm.json)
+(For The Project.) (in qpm.json)
 
 * beatsaber-hook ^6.4.2
 * bs-cordl 4008.*
@@ -57,15 +81,12 @@ If you have QPM installed but throws an error, use `.\qpm` instead
 * cpp-semver ^0.1.2
 * metacore ^1.0.3
 
+MOST OF THESE ARE BASE CORE MODS INSTALLED WHEN YOU USE MBF. MOST ARE NEEDED TO BE INSTALLED MANUALLY.
+
 ## Credits
-axo-lotl. (2026). GitHub - *axo-lotl/Vivify-Quest: vivify quest port (new repo for some reason).* GitHub. https://github.com/axo-lotl/vivify-quest
+Below is the credits to most of this source. i do not want to steal code from others so this is credits to them. (REMEMBER WHEN YOU BORROW CODE. ALWAYS GIVE CREDITS YA LIL SKID)
 
-*This project contains code that was adapted from an open-source repository by [LookingForScripts1](https://github.com/Lookingforscripts1) that has since been deleted. Because the repository is no longer available, I am unfortunately unable to identify or link to the original repository.*
+* [Axo-lotl](https://github.com/axo-lotl)
+* [LookingForScripts1](https://github.com/Lookingforscripts1)
 
-### Special thanks
-Thank you to axo-lotl for giving version 0.4.0 early to meh :)
-
-## License details
-All rights reserved.
-
-No part of this repository may be copied, modified, distributed, or incorporated into other software without the express written permission of the repository owner.
+I borrowed most of this code from LookingForScripts. Thank you to them for getting this port to work!

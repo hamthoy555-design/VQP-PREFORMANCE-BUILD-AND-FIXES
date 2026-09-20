@@ -1,13 +1,13 @@
 {
   "$schema": "https://raw.githubusercontent.com/QuestPackageManager/QPM.Package/refs/heads/main/qpm.shared.schema.json",
   "config": {
-    "version": "0.4.13",
+    "version": "0.4.14",
     "sharedDir": "shared",
     "dependenciesDir": "extern",
     "info": {
       "name": "Vivify",
       "id": "vivify",
-      "version": "0.4.13",
+      "version": "0.4.14",
       "url": "https://github.com/Lookingforscripts1/Vivify-Quest3.0fork/",
       "additionalData": {
         "overrideSoName": "libvivify.so",
